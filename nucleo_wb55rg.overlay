@@ -1,0 +1,53 @@
+/ {
+	aliases {
+		adc0 = &adc1;
+	};
+};
+
+/* Ensure ADC1 is enabled (board DTS already sets it to "okay" but we re-assert it) */
+&adc1 {
+	status = "okay";
+	pinctrl-0 = <&adc1_in3_pc2 &adc1_in5_pa0 &adc1_in6_pa1>; /* default ADC input pins on the board */
+	pinctrl-names = "default";
+};
+
+/ {
+    chosen {
+        zephyr,pwm = &pwm1;
+    };
+};
+
+/* Enable TIM1 as PWM controller */
+&pwm1 {
+    status = "okay";
+    pinctrl-0 = <&pwm1_ch1_pa8 &pwm1_ch2_pa9 &pwm1_ch3_pa10 &tim1_ch1n_pb13 &tim1_ch2n_pb14 &tim1_ch3n_pb15>;
+    pinctrl-names = "default";
+};
+
+/* Define PWM pins for TIM1 */
+&pinctrl {
+    pwm1_ch1_pa8: pwm1_ch1_pa8 {
+        pinmux = <STM32_PINMUX('A', 8, AF1)>;   /* TIM1_CH1 */
+        bias-pull-down;
+    };
+    pwm1_ch2_pa9: pwm1_ch2_pa9 {
+        pinmux = <STM32_PINMUX('A', 9, AF1)>;   /* TIM1_CH2 */
+        bias-pull-down;
+    };
+    pwm1_ch3_pa10: pwm1_ch3_pa10 {
+        pinmux = <STM32_PINMUX('A', 10, AF1)>;  /* TIM1_CH3 */
+        bias-pull-down;
+    };
+    pwm1_ch1n_pb13: pwm1_ch1n_pb13 {
+        pinmux = <STM32_PINMUX('B', 13, AF1)>;   /* TIM1_CH1 */
+        bias-pull-down;
+    };
+    pwm1_ch2n_pb14: pwm1_ch2n_pb14 {
+        pinmux = <STM32_PINMUX('B', 14, AF1)>;   /* TIM1_CH1 */
+        bias-pull-down;
+    };
+    pwm1_ch3n_pb15: pwm1_ch3n_pb15 {
+        pinmux = <STM32_PINMUX('B', 15, AF1)>;   /* TIM1_CH1 */
+        bias-pull-down;
+    };
+};
