@@ -30,16 +30,20 @@
 #define STACK_USER_INPUT 1024
 #define PRIO_USER_INPUT  6
 
+#define STACK_PID        1024
+#define PRIO_PID         5
+
 #define STACK_PWM        1024
 #define PRIO_PWM         4
 
 #define STACK_HALL_MON   1024
-#define PRIO_HALL_MON    5
+#define PRIO_HALL_MON    3
 
 /* Globals near top */
 static int rpm_target = 0;
 static int measured_rpm = 0;
 static int prev_state = 0;
+static int counter_clockwise = 0;
 static struct k_mutex rpm_lock;
 
 
@@ -100,7 +104,6 @@ void enable_tim1_complementary_outputs(void) {
     // Enable outputs on CH1–3 and CH1N–3N
     TIM1->BDTR |= TIM_BDTR_MOE; // enable main output
     //TIM1->CCER |= TIM_CCER_CC1NE | TIM_CCER_CC2NE | TIM_CCER_CC3NE; // enable CHxN
-
 }
 
 void set_commutation_step(uint8_t step)
@@ -129,6 +132,25 @@ void set_commutation_step(uint8_t step)
     case 3: // W+ U-
         TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC1NE;
         break;
+    // +8 for counter clockwise
+    case 9: // U+ V-
+        TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2NE;
+        break;
+    case 13: // W+ V-
+        TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC2NE;
+        break;
+    case 12: // W+ U-
+        TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC1NE;
+        break;
+    case 14: // V+ U-
+        TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC1NE;
+        break;
+    case 10: // V+ W-
+        TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC3NE;
+        break;
+    case 11: // U+ W-
+        TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC3NE;
+        break;
     }
 }
 
@@ -149,6 +171,57 @@ int rpm_to_pulse(int rpm){
     pulse = (rpm * 8.836)+3160;
     printk("new pulse value = %d\r\n", pulse);
     return pulse;
+}
+
+typedef struct {
+    float kp;
+    float ki;
+    float kd;
+    float prev_error;
+    float integral;
+    float out_min;
+    float out_max;
+} pid_struct;
+
+static pid_struct rpm_pid;
+
+void pid_init(pid_struct *pid, float kp, float ki, float kd, float out_min, float out_max)
+{
+    pid->kp = kp;
+    pid->ki = ki;
+    pid->kd = kd;
+
+    pid->prev_error = 0.0f;
+    pid->integral   = 0.0f;
+
+    pid->out_min = out_min;
+    pid->out_max = out_max;
+}
+
+float pid_compute(pid_struct *pid, float target, float measured, float dt)
+{
+    float error = target - measured;
+
+    // Integral term
+    pid->integral += error * pid->ki * dt;
+
+    // Anti-windup
+    if (pid->integral > pid->out_max) pid->integral = pid->out_max;
+    if (pid->integral < pid->out_min) pid->integral = pid->out_min;
+
+    // Derivative term
+    float derivative = (error - pid->prev_error) / dt;
+
+    // PID output
+    float output = pid->kp * error + pid->integral + pid->kd * derivative;
+
+    // Clamp to limits
+    if (output > pid->out_max) output = pid->out_max;
+    if (output < pid->out_min) output = pid->out_min;
+
+    pid->prev_error = error;
+
+    return output;
 }
 
 int get_rpm_from_terminal(void)
@@ -189,6 +262,23 @@ int get_rpm_from_terminal(void)
 
     return rpm;
 }
+
+void pid_thread(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+
+    pid_init(&rpm_pid, 0.2, 0.05, 0.01, 0, 100);
+
+    while (1) {
+        int rpm_pid_val = 50 * pid_compute(&rpm_pid, rpm_target, measured_rpm, 0.01f);
+        all_pwm_set(rpm_to_pulse(rpm_pid_val));
+        set_commutation_step(prev_state);
+        k_msleep(10);
+    }
+}
+
+K_THREAD_STACK_DEFINE(pid_stack, STACK_PID);
+static struct k_thread pid_tid;
 
 void user_input_thread(void *p1, void *p2, void *p3)
 {
@@ -232,7 +322,7 @@ void pwm_thread(void *p1, void *p2, void *p3)
         if (read_adc_mv(ADC_CHANNEL_B, &mv) == 0) V = sensor_from_mv(mv);
         if (read_adc_mv(ADC_CHANNEL_C, &mv) == 0) W = sensor_from_mv(mv);
 
-        uint8_t state = (U << 2) | (V << 1) | W;
+        uint8_t state = (counter_clockwise << 3) | (U << 2) | (V << 1) | W;
 
         if (state != prev_state){
             if (state == 0){
@@ -243,7 +333,7 @@ void pwm_thread(void *p1, void *p2, void *p3)
                 k_mutex_unlock(&rpm_lock);
 
                 set_commutation_step(state);
-                printk("Sensors: U=%d V=%d W=%d\n", U, V, W);
+                printk("Sensors: C=%d U=%d V=%d W=%d\n", counter_clockwise, U, V, W);
             }
         }
 
@@ -340,6 +430,9 @@ int main()
                     hall_monitor_thread, NULL, NULL, NULL,
                     PRIO_HALL_MON, 0, K_NO_WAIT);
 
+    k_thread_create(&pid_tid, pid_stack, K_THREAD_STACK_SIZEOF(pid_stack),
+                    pid_thread, NULL, NULL, NULL,
+                    PRIO_PID, 0, K_NO_WAIT);
     //     int interval_ms = 100;
 
     //     int rpm = get_rpm_from_terminal();
