@@ -46,7 +46,6 @@ static int prev_state = 0;
 static int counter_clockwise = 0;
 static struct k_mutex rpm_lock;
 
-
 #if DT_NODE_HAS_STATUS(ADC_DEV_NODE, okay)
 static const struct device *adc_dev = DEVICE_DT_GET(ADC_DEV_NODE);
 #else
@@ -169,7 +168,7 @@ int rpm_to_pulse(int rpm){
     // printk("Recieved rpm = %d\r\n", rpm);
     int pulse =0;
     pulse = (rpm * 8.836)+3160;
-    printk("new pulse value = %d\r\n", pulse);
+    //printk("new pulse value = %d\r\n", pulse);
     return pulse;
 }
 
@@ -270,10 +269,10 @@ void pid_thread(void *p1, void *p2, void *p3)
     pid_init(&rpm_pid, 0.2, 0.05, 0.01, 0, 100);
 
     while (1) {
-        int rpm_pid_val = 50 * pid_compute(&rpm_pid, rpm_target, measured_rpm, 0.01f);
+        int rpm_pid_val = 50 * pid_compute(&rpm_pid, rpm_target, measured_rpm, 0.1f);
         all_pwm_set(rpm_to_pulse(rpm_pid_val));
         set_commutation_step(prev_state);
-        k_msleep(10);
+        k_msleep(100);
     }
 }
 
@@ -403,8 +402,6 @@ static struct k_thread hall_tid;
 
 int main()
 {
-    // int pulse = PERIOD_NS/2;
-
     if (!device_is_ready(pwm_dev)) {
     printk("Error: PWM device not ready\n");
     }
@@ -433,23 +430,6 @@ int main()
     k_thread_create(&pid_tid, pid_stack, K_THREAD_STACK_SIZEOF(pid_stack),
                     pid_thread, NULL, NULL, NULL,
                     PRIO_PID, 0, K_NO_WAIT);
-    //     int interval_ms = 100;
 
-    //     int rpm = get_rpm_from_terminal();
-
-    //     Example: use RPM value for control logic
-    //     printk("Setting control loop target RPM = %d\r\n", rpm);
-
-    //     pulse = rpm_to_pulse(rpm);
-
-    //     printk("Creating PWM with pulse = %d\r\n", pulse);
-
-    //     all_pwm_set(pulse);
-
-    //     printk("Sensors: U=%d V=%d W=%d\n", sa, sb, sc);
-    //     printk("case state: %d\n", state);
-
-    //     k_msleep(interval_ms);
-    //     }
     return 0;
 }
