@@ -1,435 +1,247 @@
-#include <zephyr/kernel.h>
 #include <zephyr/device.h>
-#include <zephyr/drivers/gpio.h>
-#include <zephyr/drivers/adc.h>
-#include <zephyr/drivers/pwm.h>
 #include <zephyr/sys/printk.h>
-#include <stdlib.h>
 #include <soc.h>
+#include <zephyr/kernel.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/console/console.h>
-#include <stdint.h>
-#include <zephyr/drivers/uart.h>
-#include <zephyr/sys/printk.h>
-#include <stdio.h>
-#include <string.h>
+#include <stm32wbxx.h> // Required for bare-metal TIM1 register access
 
-#define ADC_DEV_NODE DT_ALIAS(adc0)
+// --- Hardware Setup & Globals ---
+static const struct gpio_dt_spec hall_u = GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), hall_u_gpios);
+static const struct gpio_dt_spec hall_v = GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), hall_v_gpios);
+static const struct gpio_dt_spec hall_w = GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), hall_w_gpios);
 
-#define ADC_CHANNEL_A 3  /* PC2 U phase */
-#define ADC_CHANNEL_B 5  /* PA0 V phase */
-#define ADC_CHANNEL_C 6  /* PA1 W phase */
-#define ADC_RESOLUTION 12U
-#define ADC_REF_MV 3300U
-#define SENSOR_THRESHOLD_MV 1900
-#define ADC_BUFFER_SIZE 1
+static struct gpio_callback hall_port_a_cb;
+static struct gpio_callback hall_port_c_cb;
 
-/* Motor electrical properties */
-#define POLE_PAIRS       8
+volatile bool is_running = false;
+volatile uint8_t current_hall_state = 0;
 
-// thread parameters
-#define STACK_USER_INPUT 1024
-#define PRIO_USER_INPUT  6
+// --- PWM Frequency & Duty Cycle Configuration ---
+// Note: If your Zephyr board config pushes the STM32WB to 64MHz, change this to 64000000
+#define TIMER_CLOCK_HZ  32000000  
+#define TARGET_PWM_FREQ 21000    
 
-#define STACK_PID        1024
-#define PRIO_PID         5
+// The math: ARR = (Timer Clock / Target Frequency)
+// At 32MHz and 21kHz, ARR evaluates to exactly 1280.
+#define PWM_PERIOD_ARR  (TIMER_CLOCK_HZ / TARGET_PWM_FREQ)
 
-#define STACK_PWM        1024
-#define PRIO_PWM         4
+// Dynamic Duty Cycle Calculations
+#define DUTY_LOW_95     ((PWM_PERIOD_ARR * 95) / 100) // 95% low-side (5% high-side)
+#define DUTY_TARGET     ((PWM_PERIOD_ARR * 80) / 100) // 50% target running duty
+#define DUTY_START      ((PWM_PERIOD_ARR * 30)  / 100) // 5% starting duty
+#define DUTY_STEP       ((PWM_PERIOD_ARR * 5)  / 1000)// Increase by 0.5% every step
+#define STEP_DELAY_MS   20                            // Milliseconds between steps
 
-#define STACK_HALL_MON   1024
-#define PRIO_HALL_MON    3
+volatile uint32_t active_duty = DUTY_START;
 
-/* Globals near top */
-static int rpm_target = 0;
-static int measured_rpm = 0;
-static int prev_state = 0;
-static int counter_clockwise = 0;
-static struct k_mutex rpm_lock;
-
-#if DT_NODE_HAS_STATUS(ADC_DEV_NODE, okay)
-static const struct device *adc_dev = DEVICE_DT_GET(ADC_DEV_NODE);
-#else
-static const struct device *adc_dev = NULL;
-#endif
-
-static int16_t adc_buffer[ADC_BUFFER_SIZE];
-
-static inline int32_t adc_raw_to_mv(int32_t raw)
+// --- Commutation Engine ---
+void commutate(uint8_t step)
 {
-    int32_t max_raw = (1 << ADC_RESOLUTION) - 1;
-    return (raw * (int32_t)ADC_REF_MV) / max_raw;
-}
-
-static int read_adc_mv(uint8_t channel, int32_t *out_mv)
-{
-    if (!adc_dev || !device_is_ready(adc_dev)) return -ENODEV;
-
-    struct adc_channel_cfg ch_cfg = {
-        .gain = ADC_GAIN_1,
-        .reference = ADC_REF_INTERNAL,
-        .acquisition_time = ADC_ACQ_TIME_DEFAULT,
-        .channel_id = channel,
-    };
-
-    int rc = adc_channel_setup(adc_dev, &ch_cfg);
-    if (rc) return rc;
-
-    const struct adc_sequence seq = {
-        .channels = BIT(channel),
-        .buffer = adc_buffer,
-        .buffer_size = sizeof(adc_buffer),
-        .resolution = ADC_RESOLUTION,
-    };
-
-    rc = adc_read(adc_dev, &seq);
-    if (rc) return rc;
-
-    int32_t raw = adc_buffer[0];
-    *out_mv = adc_raw_to_mv(raw);
-    return 0;
-}
-
-/* Convert voltage reading to digital sensor value (0 or 1) */
-static inline int sensor_from_mv(int32_t mv)
-{
-    return (mv > SENSOR_THRESHOLD_MV) ? 1 : 0;
-}
-
-const struct device *pwm_dev = DEVICE_DT_GET(DT_NODELABEL(pwm1));
-
-#define PERIOD_NS (50000)  // 1 / 20kHz = 50µs = 50000ns
-
-void enable_tim1_complementary_outputs(void) {
-    // Enable outputs on CH1–3 and CH1N–3N
-    TIM1->BDTR |= TIM_BDTR_MOE; // enable main output
-    //TIM1->CCER |= TIM_CCER_CC1NE | TIM_CCER_CC2NE | TIM_CCER_CC3NE; // enable CHxN
-}
-
-void set_commutation_step(uint8_t step)
-{
-    // Clear all outputs
+    current_hall_state = step;
+    // Disable all outputs first (this natively acts as our "Deactivate" state)
     TIM1->CCER &= ~(TIM_CCER_CC1E | TIM_CCER_CC1NE |
                     TIM_CCER_CC2E | TIM_CCER_CC2NE |
                     TIM_CCER_CC3E | TIM_CCER_CC3NE);
 
-    switch (step) {
-    case 1: // W+ V-
-        TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC2NE;
-        break;//
-    case 5: // U+ V-
-        TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2NE;
-        break;
-    case 4: // U+ W-
-        TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC3NE;
-        break;
-    case 6: // V+ W-
-        TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC3NE;
-        break;
-    case 2: // V+ U-
-        TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC1NE;
-        break;
-    case 3: // W+ U-
-        TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC1NE;
-        break;
-    // +8 for counter clockwise
-    case 9: // U+ V-
-        TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2NE;
-        break;
-    case 13: // W+ V-
-        TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC2NE;
-        break;
-    case 12: // W+ U-
-        TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC1NE;
-        break;
-    case 14: // V+ U-
-        TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC1NE;
-        break;
-    case 10: // V+ W-
-        TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC3NE;
-        break;
-    case 11: // U+ W-
-        TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC3NE;
-        break;
-    }
-}
-
-void all_pwm_set(int pulse){
-
-    pwm_set(pwm_dev, 1, PERIOD_NS, pulse, 0); // channel 1
-    pwm_set(pwm_dev, 2, PERIOD_NS, pulse, 0); // channel 2
-    pwm_set(pwm_dev, 3, PERIOD_NS, pulse, 0); // channel 3
-
-    enable_tim1_complementary_outputs();
-}
-
-int rpm_to_pulse(int rpm){
-    // 326 min (3160)
-    // 4744 max (47340)
-    // printk("Recieved rpm = %d\r\n", rpm);
-    int pulse =0;
-    pulse = (rpm * 8.836)+3160;
-    //printk("new pulse value = %d\r\n", pulse);
-    return pulse;
-}
-
-typedef struct {
-    float kp;
-    float ki;
-    float kd;
-    float prev_error;
-    float integral;
-    float out_min;
-    float out_max;
-} pid_struct;
-
-static pid_struct rpm_pid;
-
-void pid_init(pid_struct *pid, float kp, float ki, float kd, float out_min, float out_max)
-{
-    pid->kp = kp;
-    pid->ki = ki;
-    pid->kd = kd;
-
-    pid->prev_error = 0.0f;
-    pid->integral   = 0.0f;
-
-    pid->out_min = out_min;
-    pid->out_max = out_max;
-}
-
-float pid_compute(pid_struct *pid, float target, float measured, float dt)
-{
-    float error = target - measured;
-
-    // Integral term
-    pid->integral += error * pid->ki * dt;
-
-    // Anti-windup
-    if (pid->integral > pid->out_max) pid->integral = pid->out_max;
-    if (pid->integral < pid->out_min) pid->integral = pid->out_min;
-
-    // Derivative term
-    float derivative = (error - pid->prev_error) / dt;
-
-    // PID output
-    float output = pid->kp * error + pid->integral + pid->kd * derivative;
-
-    // Clamp to limits
-    if (output > pid->out_max) output = pid->out_max;
-    if (output < pid->out_min) output = pid->out_min;
-
-    pid->prev_error = error;
-
-    return output;
-}
-
-int get_rpm_from_terminal(void)
-{
-    char buffer[16];
-    int index = 0;
-    int rpm = 0;
-
-    printk("Enter desired RPM 0-5000 (digits only):\r\n");
-
-    while (1) {
-        int c = console_getchar();  // Blocking read from UART
-
-        if (c == '\r') {
-            buffer[index] = '\0';
-            rpm = atoi(buffer);     // Convert string to int
-            if (rpm < 0){
-                rpm = 0;
-            } else if (rpm > 5000){
-                rpm = 5000;
-            }
-            printk("\r\nReceived RPM = %d\r\n", rpm);
-            break;
-        } else if (c >= '0' && c <= '9') {
-            if (index < sizeof(buffer) - 1) {
-                buffer[index++] = (char)c;
-                console_putchar(c); // Echo back
-            }
-        } else if (c == 0x7F || c == '\b') { // Handle backspace
-            if (index > 0) {
-                index--;
-                printk("\b \b");
-            }
-        }
-
-        k_msleep(2); // Small delay to prevent input flooding
+    if (!is_running) {
+        // STOP STATE: All Low-sides at 85% for Bootstrap charging
+        TIM1->CCR1 = DUTY_LOW_95;
+        TIM1->CCR2 = DUTY_LOW_95;
+        TIM1->CCR3 = DUTY_LOW_95;
+        
+        TIM1->CCER = TIM_CCER_CC1NE | TIM_CCER_CC2NE | TIM_CCER_CC3NE;
+        return;
     }
 
-    return rpm;
-}
-
-void pid_thread(void *p1, void *p2, void *p3)
-{
-    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
-
-    pid_init(&rpm_pid, 0.2, 0.05, 0.01, 0, 100);
-
-    while (1) {
-        int rpm_pid_val = 50 * pid_compute(&rpm_pid, rpm_target, measured_rpm, 0.1f);
-        all_pwm_set(rpm_to_pulse(rpm_pid_val));
-        set_commutation_step(prev_state);
-        k_msleep(100);
-    }
-}
-
-K_THREAD_STACK_DEFINE(pid_stack, STACK_PID);
-static struct k_thread pid_tid;
-
-void user_input_thread(void *p1, void *p2, void *p3)
-{
-    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
-
-    console_init();
-    printk("BLDC Control Ready.\r\n");
-
+    // RUNNING STATE: Apply the current dynamically ramping duty cycle
     
-    while (1) {
-        int rpm = get_rpm_from_terminal();
-
-        k_mutex_lock(&rpm_lock, K_FOREVER);
-        if (rpm_target != rpm){
-            rpm_target = rpm;
-            all_pwm_set(rpm_to_pulse(rpm_target));
-            set_commutation_step(prev_state);
-        }
-        k_mutex_unlock(&rpm_lock);
-
-        printk("\r\nNew target RPM = %d\r\n", rpm_target);
-
-        k_msleep(10);
+    switch (step) {
+    case 5: // U+ W-
+        TIM1->CCR1 = active_duty;
+        TIM1->CCR3 = DUTY_LOW_95;
+        TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC3NE;
+        break;
+    case 4: // V+ W-
+        TIM1->CCR1 = active_duty;
+        TIM1->CCR2 = DUTY_LOW_95;
+        TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2NE;
+        break;
+    case 6: // V+ U-
+        TIM1->CCR3 = active_duty;
+        TIM1->CCR2 = DUTY_LOW_95;
+        TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC2NE;
+        break;
+    case 2: // W+ U-
+        TIM1->CCR3 = active_duty;
+        TIM1->CCR1 = DUTY_LOW_95;
+        TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC1NE;
+        break;
+    case 3: // W+ V-
+        TIM1->CCR2 = active_duty;
+        TIM1->CCR1 = DUTY_LOW_95;
+        TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC1NE;
+        break;
+    case 1: // U+ V-
+        TIM1->CCR2 = active_duty;
+        TIM1->CCR3 = DUTY_LOW_95;
+        TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC3NE;
+        break;
+    default:
+        // Passing 0 or 7 disables all phases, which handles deactivation cleanly.
+        break;
     }
 }
 
-K_THREAD_STACK_DEFINE(user_stack, STACK_USER_INPUT);
-static struct k_thread user_tid;
+// --- Hall Sensor ISR ---
+void hall_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+    uint8_t hu = (GPIOC->IDR & (1 << 2)) ? 1 : 0; 
+    uint8_t hv = (GPIOC->IDR & (1 << 3)) ? 1 : 0; 
+    uint8_t hw = (GPIOA->IDR & (1 << 1)) ? 1 : 0; 
+    uint8_t state = (hu << 2) | (hv << 1) | hw;
+    
+    commutate(state);
+}
 
-void pwm_thread(void *p1, void *p2, void *p3)
-{
-    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+// --- Helper Functions ---
+uint8_t get_hall_state(void) {
+    uint8_t hu = (GPIOC->IDR & (1 << 2)) ? 1 : 0; 
+    uint8_t hv = (GPIOC->IDR & (1 << 3)) ? 1 : 0; 
+    uint8_t hw = (GPIOA->IDR & (1 << 1)) ? 1 : 0; 
+    return (hu << 2) | (hv << 1) | hw;
+}
 
-    printk("PWM thread started.\r\n");
+// --- Hardware Initialization ---
+void setup_motor_pwm(void) {
+    RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
+
+    TIM1->PSC = 0; 
+    TIM1->ARR = PWM_PERIOD_ARR; // Set to exactly 25 kHz
+
+    // Configure Channels 1, 2, 3 to PWM Mode 1
+    TIM1->CCMR1 = TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_2 | TIM_CCMR1_OC2M_1 | TIM_CCMR1_OC2M_2;
+    TIM1->CCMR2 = TIM_CCMR2_OC3M_1 | TIM_CCMR2_OC3M_2;
+
+    // Enable Preload
+    TIM1->CCMR1 |= TIM_CCMR1_OC1PE | TIM_CCMR1_OC2PE;
+    TIM1->CCMR2 |= TIM_CCMR2_OC3PE;
+
+    // 3. Set Dead-Time (~1us for a 32MHz clock -> DTG = 32)
+    uint32_t dtg_value = 32; 
+    TIM1->BDTR &= ~TIM_BDTR_DTG;             
+    TIM1->BDTR |= (dtg_value & TIM_BDTR_DTG);
+    
+    // makes the channels inverse of each other
+    TIM1->CCER |= (TIM_CCER_CC1E | TIM_CCER_CC1NE);
+    TIM1->CCER |= (TIM_CCER_CC2E | TIM_CCER_CC2NE);
+    TIM1->CCER |= (TIM_CCER_CC3E | TIM_CCER_CC3NE);
+
+    // 4. Initialize duty cycles to 0
+    TIM1->CCR1 = 0;
+    TIM1->CCR2 = 0;
+    TIM1->CCR3 = 0;
+
+    // Main Output Enable (MOE)
+    TIM1->BDTR |= TIM_BDTR_MOE;
+
+    // Start Timer
+    TIM1->CR1 |= TIM_CR1_CEN;
+}
+
+void setup_hall_interrupts(void) {
+    gpio_pin_configure_dt(&hall_u, GPIO_INPUT);
+    gpio_pin_configure_dt(&hall_v, GPIO_INPUT);
+    gpio_pin_configure_dt(&hall_w, GPIO_INPUT);
+
+    gpio_pin_interrupt_configure_dt(&hall_u, GPIO_INT_EDGE_BOTH);
+    gpio_pin_interrupt_configure_dt(&hall_v, GPIO_INT_EDGE_BOTH);
+    gpio_pin_interrupt_configure_dt(&hall_w, GPIO_INT_EDGE_BOTH);
+
+    gpio_init_callback(&hall_port_c_cb, hall_isr, BIT(hall_u.pin) | BIT(hall_v.pin));
+    gpio_init_callback(&hall_port_a_cb, hall_isr, BIT(hall_w.pin));
+
+    gpio_add_callback(hall_u.port, &hall_port_c_cb); 
+    gpio_add_callback(hall_w.port, &hall_port_a_cb); 
+}
+
+// --- Background Soft-Start & Telemetry Thread ---
+void control_thread_fn(void) {
+    int print_counter = 0;
 
     while (1) {
-        int32_t mv;
-        int U = 0, V = 0, W = 0;
+        // 1. Process Soft-Start Ramp
+        if (is_running && (active_duty < DUTY_TARGET)) {
+            active_duty += DUTY_STEP;
+            if (active_duty > DUTY_TARGET) {
+                active_duty = DUTY_TARGET;
+            }
+            // TIM1->CCR1 = active_duty;
+            // TIM1->CCR2 = active_duty;
+            // TIM1->CCR3 = active_duty;
+        }
 
-        if (read_adc_mv(ADC_CHANNEL_A, &mv) == 0) U = sensor_from_mv(mv);
-        if (read_adc_mv(ADC_CHANNEL_B, &mv) == 0) V = sensor_from_mv(mv);
-        if (read_adc_mv(ADC_CHANNEL_C, &mv) == 0) W = sensor_from_mv(mv);
+        // 2. Telemetry Printout (Every 500ms = 25 ticks of 20ms)
+        if (++print_counter >= 25) {
+            // Calculate actual percentage to print to the terminal
+            uint32_t current_percent = (active_duty * 100) / PWM_PERIOD_ARR;
+            if (!is_running) current_percent = 85; // Display bootstrap duty when stopped
+            
+            printk("[TELEMETRY] Motor: %s | Duty: %d%% | Hall State: %d\n", 
+                   is_running ? "RUNNING" : "STOPPED", 
+                   current_percent, 
+                   current_hall_state);
+            print_counter = 0;
+        }
+        
+        k_msleep(STEP_DELAY_MS);
+    }
+}
 
-        uint8_t state = (counter_clockwise << 3) | (U << 2) | (V << 1) | W;
+K_THREAD_DEFINE(control_thread_id, 1024, control_thread_fn, NULL, NULL, NULL, 7, 0, 0);
 
-        if (state != prev_state){
-            if (state == 0){
-                set_commutation_step(prev_state);
+// --- Main Loop ---
+int main(void) {
+    console_init();
+    
+    setup_hall_interrupts();
+    setup_motor_pwm();
+
+    commutate(get_hall_state());
+
+    printk("System Ready (PWM Frequency: 21 kHz)\n");
+    printk("Bootstrap Active: Low-sides holding at 85%%.\n");
+    printk("Press 's' to START.\n");
+    printk("Press [ENTER] (or any other key) to STOP.\n");
+
+    while (1) {
+        char s = console_getchar(); // Blocks until a SINGLE character is pressed
+        
+        // 1. Handle the "Double Input" from terminal emulators
+        // Terminals often send Carriage Return ('\r') followed by Line Feed ('\n').
+        // We simply ignore the Line Feed so it doesn't trigger our logic twice.
+        if (s == '\n') {
+            continue; 
+        }
+
+        // 2. Start Command
+        if (s == 's' || s == 'S') {
+            if (!is_running) {
+                is_running = true;
+                active_duty = DUTY_START; // Reset back to 5% before starting
+                printk("\n>>> COMMAND: Motor STARTING. Ramping from 5%% to 50%%...\n");
+                commutate(get_hall_state());
             } else {
-                k_mutex_lock(&rpm_lock, K_FOREVER);
-                prev_state = state;
-                k_mutex_unlock(&rpm_lock);
-
-                set_commutation_step(state);
-                printk("Sensors: C=%d U=%d V=%d W=%d\n", counter_clockwise, U, V, W);
+                printk("\n>>> Note: Motor is already running.\n");
+            }
+        } 
+        // 3. Stop Command (Enter '\r', spacebar, or any other panic key)
+        else {
+            if (is_running) {
+                is_running = false;
+                printk("\n>>> COMMAND: Motor STOPPED. Bootstrap Active.\n");
+                commutate(get_hall_state());
             }
         }
-
-        k_msleep(5);
     }
-
-}
-
-K_THREAD_STACK_DEFINE(pwm_stack, STACK_PWM);
-static struct k_thread pwm_tid;
-
-void hall_monitor_thread(void *p1, void *p2, void *p3)
-{
-    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
-
-    uint8_t last_state = 0xff;
-    uint32_t last_timestamp_ms = k_uptime_get_32();
-    uint32_t local_measured_rpm = 0;
-
-    printk("Hall monitor thread started.\r\n");
-
-    while (1) {
-        int32_t mv_a = 0, mv_b = 0, mv_c = 0;
-        int a = 0, b = 0, c = 0;
-
-        if (read_adc_mv(ADC_CHANNEL_A, &mv_a) == 0) a = sensor_from_mv(mv_a);
-        if (read_adc_mv(ADC_CHANNEL_B, &mv_b) == 0) b = sensor_from_mv(mv_b);
-        if (read_adc_mv(ADC_CHANNEL_C, &mv_c) == 0) c = sensor_from_mv(mv_c);
-
-        uint8_t state = (a << 2) | (b << 1) | c;
-
-        uint32_t now = k_uptime_get_32();
-
-        if (state != last_state) {
-            /* compute time since last change */
-            uint32_t dt = now - last_timestamp_ms;
-            last_timestamp_ms = now;
-
-            if (dt > 0) {
-                /* dt is ms per state transition
-                 * electrical RPM = 60000 / (dt_ms * transitions_per_elec_rev)
-                 * transitions_per_elec_rev for 6-step = 6
-                 */
-                float erpm = 60000.0f / ((float)dt * 6.0f);
-                /* mechanical RPM = electrical RPM / pole_pairs */
-                local_measured_rpm = (uint32_t)(erpm / (float)POLE_PAIRS + 0.5f);
-            }
-
-            /* publish measured rpm safely */
-            k_mutex_lock(&rpm_lock, K_FOREVER);
-            measured_rpm = (int)local_measured_rpm;
-            k_mutex_unlock(&rpm_lock);
-
-            /* print hall state + measured rpm */
-            printk("Measured RPM: %u\n",
-                   local_measured_rpm);
-
-            last_state = state;
-        }
-
-        k_msleep(20); /* poll interval */
-    }
-}
-
-K_THREAD_STACK_DEFINE(hall_stack, STACK_HALL_MON);
-static struct k_thread hall_tid;
-
-int main()
-{
-    if (!device_is_ready(pwm_dev)) {
-    printk("Error: PWM device not ready\n");
-    }
-
-    if (!adc_dev || !device_is_ready(adc_dev)) {
-        printk("Warning: ADC device not ready.\n");
-    } else {
-        printk("ADC ready\n");
-    }
-
-    /* called once in main */
-    k_mutex_init(&rpm_lock);
-
-    k_thread_create(&user_tid, user_stack, K_THREAD_STACK_SIZEOF(user_stack),
-                    user_input_thread, NULL, NULL, NULL,
-                    PRIO_USER_INPUT, 0, K_NO_WAIT);
-
-    k_thread_create(&pwm_tid, pwm_stack, K_THREAD_STACK_SIZEOF(pwm_stack),
-                    pwm_thread, NULL, NULL, NULL,
-                    PRIO_PWM, 0, K_NO_WAIT);
-
-    k_thread_create(&hall_tid, hall_stack, K_THREAD_STACK_SIZEOF(hall_stack),
-                    hall_monitor_thread, NULL, NULL, NULL,
-                    PRIO_HALL_MON, 0, K_NO_WAIT);
-
-    k_thread_create(&pid_tid, pid_stack, K_THREAD_STACK_SIZEOF(pid_stack),
-                    pid_thread, NULL, NULL, NULL,
-                    PRIO_PID, 0, K_NO_WAIT);
-
     return 0;
 }
