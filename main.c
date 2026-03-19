@@ -43,13 +43,13 @@ volatile uint8_t delta_idx = 0;
 
 // Dynamic Duty Cycle Calculations
 #define DUTY_LOW_95     ((PWM_PERIOD_ARR * 95) / 100) // 95% low-side (5% high-side)
-#define DUTY_TARGET     ((PWM_PERIOD_ARR * 70) / 100) // 50% target running duty
-#define DUTY_START      ((PWM_PERIOD_ARR * 30)  / 100) // 5% starting duty
+#define DUTY_TARGET     ((PWM_PERIOD_ARR * 40) / 100) // 50% target running duty
+#define DUTY_START      ((PWM_PERIOD_ARR * 10)  / 100) // 5% starting duty
 #define DUTY_STEP       ((PWM_PERIOD_ARR * 5)  / 1000)// Increase by 0.5% every step
 #define STEP_DELAY_MS   20                            // Milliseconds between steps
 
 volatile uint32_t active_duty = DUTY_START;
-bool counter_clockwise = true;
+bool counter_clockwise = false;
 
 // --- Commutation Engine ---
 void commutate(uint8_t step)
@@ -212,11 +212,6 @@ void setup_motor_pwm(void) {
     uint32_t dtg_value = 32; 
     TIM1->BDTR &= ~TIM_BDTR_DTG;             
     TIM1->BDTR |= (dtg_value & TIM_BDTR_DTG);
-    
-    // makes the channels inverse of each other
-    TIM1->CCER |= (TIM_CCER_CC1E | TIM_CCER_CC1NE);
-    TIM1->CCER |= (TIM_CCER_CC2E | TIM_CCER_CC2NE);
-    TIM1->CCER |= (TIM_CCER_CC3E | TIM_CCER_CC3NE);
 
     // 4. Initialize duty cycles to 0
     TIM1->CCR1 = 0;
@@ -335,8 +330,14 @@ int main(void) {
         if (s == 's' || s == 'S') {
             if (!is_running) {
                 is_running = true;
-                active_duty = DUTY_START; // Reset back to 5% before starting
+
                 printk("\n>>> COMMAND: Motor STARTING. Ramping from 5%% to 50%%...\n");
+
+                // active_duty = (PWM_PERIOD_ARR * 40) / 100; 
+                // commutate(get_hall_state());
+                // k_msleep(10);
+
+                active_duty = DUTY_START;
                 commutate(get_hall_state());
             } else {
                 printk("\n>>> Note: Motor is already running.\n");
