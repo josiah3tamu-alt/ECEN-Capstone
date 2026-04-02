@@ -1,17 +1,28 @@
+/* Target the timer node to set up the PWM pins */
 / {
-    /* The zephyr,user node is specifically for defining custom app pins */
-    zephyr,user {
-        hall-u-gpios = <&gpioc 2 GPIO_ACTIVE_HIGH>;
-        hall-v-gpios = <&gpioc 3 GPIO_ACTIVE_HIGH>;
-        hall-w-gpios = <&gpioa 1 GPIO_ACTIVE_HIGH>; 
+    chosen {
+        zephyr,console = &cdc_acm_uart0; /* Route terminal to USB */
+        zephyr,pwm = &pwm1; 
     };
 
-    chosen {
-        zephyr,pwm = &pwm1; 
+    zephyr,user {
+        hall-u-gpios = <&gpioc 2 GPIO_ACTIVE_HIGH>;
+        hall-v-gpios = <&gpioa 0 GPIO_ACTIVE_HIGH>; /* Moved to PA0 */
+        hall-w-gpios = <&gpioa 1 GPIO_ACTIVE_HIGH>; 
     };
 };
 
-/* Target the timer node to set up the PWM pins */
+/* The Native USB Node */
+&zephyr_udc0 {
+    pinctrl-0 = <&usb_dm_pa11 &usb_dp_pa12>;
+    pinctrl-names = "default";
+    status = "okay";
+
+    cdc_acm_uart0: cdc_acm_uart0 {
+        compatible = "zephyr,cdc-acm-uart";
+    };
+};
+
 &timers1 {
     status = "okay";
 

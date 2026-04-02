@@ -3,7 +3,8 @@
 #include <soc.h>
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/console/console.h>
+#include <zephyr/usb/usb_device.h>
+#include <zephyr/drivers/uart.h>
 #include <stm32wbxx.h> // Required for bare-metal TIM1 register access
 
 // --- Hardware Setup & Globals ---
@@ -23,30 +24,24 @@ volatile uint32_t delta_ticks = 0;
 volatile bool new_rpm_data = false;
 volatile uint32_t current_rpm = 0;
 
-// Add these for the Circular Buffer
-#define HISTORY_SIZE 6
+#define HISTORY_SIZE 8
 volatile uint32_t delta_history[HISTORY_SIZE] = {0};
 volatile uint8_t delta_idx = 0;
+volatile uint32_t smoothed_rpm = 0;
 
 #define RPM_CONSTANT 2500000 
-#define TIMEOUT_TICKS 1000000 // 1 second timeout if 1 tick = 1us
+#define TIMEOUT_TICKS 1000000 
 #define RPM_CONSTANT_FILTERED 15000000
 
-// --- PWM Frequency & Duty Cycle Configuration ---
-// Note: If your Zephyr board config pushes the STM32WB to 64MHz, change this to 64000000
 #define TIMER_CLOCK_HZ  32000000  
 #define TARGET_PWM_FREQ 21000    
-
-// The math: ARR = (Timer Clock / Target Frequency)
-// At 32MHz and 21kHz, ARR evaluates to exactly 1280.
 #define PWM_PERIOD_ARR  (TIMER_CLOCK_HZ / TARGET_PWM_FREQ)
 
-// Dynamic Duty Cycle Calculations
-#define DUTY_LOW_95     ((PWM_PERIOD_ARR * 95) / 100) // 95% low-side (5% high-side)
-#define DUTY_TARGET     ((PWM_PERIOD_ARR * 40) / 100) // 50% target running duty
-#define DUTY_START      ((PWM_PERIOD_ARR * 10)  / 100) // 5% starting duty
-#define DUTY_STEP       ((PWM_PERIOD_ARR * 5)  / 1000)// Increase by 0.5% every step
-#define STEP_DELAY_MS   20                            // Milliseconds between steps
+#define DUTY_LOW_95     ((PWM_PERIOD_ARR * 95) / 100) 
+#define DUTY_TARGET     ((PWM_PERIOD_ARR * 60) / 100) 
+#define DUTY_START      ((PWM_PERIOD_ARR * 10)  / 100) 
+#define DUTY_STEP       ((PWM_PERIOD_ARR * 5)  / 1000)
+#define STEP_DELAY_MS   20                            
 
 volatile uint32_t active_duty = DUTY_START;
 bool counter_clockwise = false;
@@ -55,142 +50,120 @@ bool counter_clockwise = false;
 void commutate(uint8_t step)
 {
     current_hall_state = step;
-    // Disable all outputs first (this natively acts as our "Deactivate" state)
     TIM1->CCER &= ~(TIM_CCER_CC1E | TIM_CCER_CC1NE |
                     TIM_CCER_CC2E | TIM_CCER_CC2NE |
                     TIM_CCER_CC3E | TIM_CCER_CC3NE);
 
     if (!is_running) {
-        // STOP STATE: All Low-sides at 85% for Bootstrap charging
         TIM1->CCR1 = DUTY_LOW_95;
         TIM1->CCR2 = DUTY_LOW_95;
         TIM1->CCR3 = DUTY_LOW_95;
-        
         TIM1->CCER = TIM_CCER_CC1NE | TIM_CCER_CC2NE | TIM_CCER_CC3NE;
         return;
     }
 
-    // RUNNING STATE: Apply the current dynamically ramping duty cycle
     if (counter_clockwise){
         switch (step) {
-        case 5: // U+ W-
-            TIM1->CCR1 = active_duty;
-            TIM1->CCR3 = DUTY_LOW_95;
-            TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC3NE;
-            break;
-        case 4: // U+ V-
-            TIM1->CCR1 = active_duty;
-            TIM1->CCR2 = DUTY_LOW_95;
-            TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2NE;
-            break;
-        case 6: // W+ V-
-            TIM1->CCR3 = active_duty;
-            TIM1->CCR2 = DUTY_LOW_95;
-            TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC2NE;
-            break;
-        case 2: // W+ U-
-            TIM1->CCR3 = active_duty;
-            TIM1->CCR1 = DUTY_LOW_95;
-            TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC1NE;
-            break;
-        case 3: // V+ U-
+        case 5: 
             TIM1->CCR2 = active_duty;
             TIM1->CCR1 = DUTY_LOW_95;
             TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC1NE;
             break;
-        case 1: // V+ W-
+        case 4: 
+            TIM1->CCR3 = active_duty;
+            TIM1->CCR1 = DUTY_LOW_95;
+            TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC1NE;
+            break;
+        case 6: 
+            TIM1->CCR3 = active_duty;
+            TIM1->CCR2 = DUTY_LOW_95;
+            TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC2NE;
+            break;
+        case 2: 
+            TIM1->CCR1 = active_duty;
+            TIM1->CCR2 = DUTY_LOW_95;
+            TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2NE;
+            break;
+        case 3: 
+            TIM1->CCR1 = active_duty;
+            TIM1->CCR3 = DUTY_LOW_95;
+            TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC3NE;
+            break;
+        case 1: 
             TIM1->CCR2 = active_duty;
             TIM1->CCR3 = DUTY_LOW_95;
             TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC3NE;
             break;
-        default:
-            // Passing 0 or 7 disables all phases, which handles deactivation cleanly.
-            break;
+        default: break;
         }
     } else {
         switch (step) {
-        case 5: // V+ W-
-            TIM1->CCR2 = active_duty;
-            TIM1->CCR3 = DUTY_LOW_95;
-            TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC3NE;
-            break;
-        case 4: // U+ W- 
-            TIM1->CCR1 = active_duty;
-            TIM1->CCR3 = DUTY_LOW_95;
-            TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC3NE;
-            break;
-        case 6: // U+ V-
+        case 5: 
             TIM1->CCR1 = active_duty;
             TIM1->CCR2 = DUTY_LOW_95;
             TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2NE;
             break;
-        case 2: // W+ V-
-            TIM1->CCR3 = active_duty;
-            TIM1->CCR2 = DUTY_LOW_95;
-            TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC2NE;
+        case 4: 
+            TIM1->CCR1 = active_duty;
+            TIM1->CCR3 = DUTY_LOW_95;
+            TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC3NE;
             break;
-        case 3: // W+ U-
-            TIM1->CCR3 = active_duty;
-            TIM1->CCR1 = DUTY_LOW_95;
-            TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC1NE;
+        case 6: 
+            TIM1->CCR2 = active_duty;
+            TIM1->CCR3 = DUTY_LOW_95;
+            TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC3NE;
             break;
-        case 1: // V+ U-
+        case 2: 
             TIM1->CCR2 = active_duty;
             TIM1->CCR1 = DUTY_LOW_95;
             TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC1NE;
             break;
-        default:
+        case 3: 
+            TIM1->CCR3 = active_duty;
+            TIM1->CCR1 = DUTY_LOW_95;
+            TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC1NE;
             break;
+        case 1: 
+            TIM1->CCR3 = active_duty;
+            TIM1->CCR2 = DUTY_LOW_95;
+            TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC2NE;
+            break;
+        default: break;
         }
     }
 }
 
 void setup_tim2_freerun(void) {
-    // 1. Enable the clock for TIM2 on APB1
     RCC->APB1ENR1 |= RCC_APB1ENR1_TIM2EN;
-    
-    // 2. Set Prescaler to get a 1 MHz clock (Assuming 32MHz APB1 clock: 32 - 1 = 31)
-    // Adjust this if your Zephyr clock tree is configured differently!
     TIM2->PSC = 31;
-    
-    // 3. Set Auto-Reload Register to max 32-bit value
     TIM2->ARR = 0xFFFFFFFF;
-    
-    // 4. Generate an update event to load the prescaler immediately
     TIM2->EGR |= TIM_EGR_UG;
-    
-    // 5. Enable the timer counter
     TIM2->CR1 |= TIM_CR1_CEN;
-}
-
-// --- Hall Sensor ISR ---
-void hall_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
-    uint32_t current_ticks = TIM2->CNT;
-    
-    // Calculate delta and push to the circular buffer
-    uint32_t delta = current_ticks - previous_ticks;
-    delta_history[delta_idx] = delta;
-    
-    // Increment index and wrap around using modulo
-    delta_idx = (delta_idx + 1) % HISTORY_SIZE; 
-    
-    previous_ticks = current_ticks;
-    new_rpm_data = true;
-
-    uint8_t hu = (GPIOC->IDR & (1 << 2)) ? 1 : 0; 
-    uint8_t hv = (GPIOC->IDR & (1 << 3)) ? 1 : 0; 
-    uint8_t hw = (GPIOA->IDR & (1 << 1)) ? 1 : 0; 
-    uint8_t state = (hu << 2) | (hv << 1) | hw;
-    
-    commutate(state);
 }
 
 // --- Helper Functions ---
 uint8_t get_hall_state(void) {
-    uint8_t hu = (GPIOC->IDR & (1 << 2)) ? 1 : 0; 
-    uint8_t hv = (GPIOC->IDR & (1 << 3)) ? 1 : 0; 
-    uint8_t hw = (GPIOA->IDR & (1 << 1)) ? 1 : 0; 
+    // CRITICAL FIX: Updated register math to match your new pinout!
+    uint8_t hu = (GPIOC->IDR & (1 << 2)) ? 1 : 0; // PC2
+    uint8_t hv = (GPIOA->IDR & (1 << 0)) ? 1 : 0; // PA0
+    uint8_t hw = (GPIOA->IDR & (1 << 1)) ? 1 : 0; // PA1
     return (hu << 2) | (hv << 1) | hw;
+}
+
+#define DEBOUNCE_TICKS 100 
+void hall_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+    uint32_t current_ticks = TIM2->CNT;
+    uint32_t delta = current_ticks - previous_ticks;
+
+    if (delta < DEBOUNCE_TICKS) { return; }
+
+    delta_history[delta_idx] = delta;
+    delta_idx = (delta_idx + 1) % HISTORY_SIZE; 
+    previous_ticks = current_ticks;
+    new_rpm_data = true;
+
+    uint8_t state = get_hall_state();
+    commutate(state);
 }
 
 // --- Hardware Initialization ---
@@ -198,30 +171,23 @@ void setup_motor_pwm(void) {
     RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
 
     TIM1->PSC = 0; 
-    TIM1->ARR = PWM_PERIOD_ARR; // Set to exactly 25 kHz
+    TIM1->ARR = PWM_PERIOD_ARR; 
 
-    // Configure Channels 1, 2, 3 to PWM Mode 1
     TIM1->CCMR1 = TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_2 | TIM_CCMR1_OC2M_1 | TIM_CCMR1_OC2M_2;
     TIM1->CCMR2 = TIM_CCMR2_OC3M_1 | TIM_CCMR2_OC3M_2;
 
-    // Enable Preload
     TIM1->CCMR1 |= TIM_CCMR1_OC1PE | TIM_CCMR1_OC2PE;
     TIM1->CCMR2 |= TIM_CCMR2_OC3PE;
 
-    // 3. Set Dead-Time (~1us for a 32MHz clock -> DTG = 32)
     uint32_t dtg_value = 32; 
     TIM1->BDTR &= ~TIM_BDTR_DTG;             
     TIM1->BDTR |= (dtg_value & TIM_BDTR_DTG);
 
-    // 4. Initialize duty cycles to 0
     TIM1->CCR1 = 0;
     TIM1->CCR2 = 0;
     TIM1->CCR3 = 0;
 
-    // Main Output Enable (MOE)
     TIM1->BDTR |= TIM_BDTR_MOE;
-
-    // Start Timer
     TIM1->CR1 |= TIM_CR1_CEN;
 }
 
@@ -234,35 +200,46 @@ void setup_hall_interrupts(void) {
     gpio_pin_interrupt_configure_dt(&hall_v, GPIO_INT_EDGE_BOTH);
     gpio_pin_interrupt_configure_dt(&hall_w, GPIO_INT_EDGE_BOTH);
 
-    gpio_init_callback(&hall_port_c_cb, hall_isr, BIT(hall_u.pin) | BIT(hall_v.pin));
-    gpio_init_callback(&hall_port_a_cb, hall_isr, BIT(hall_w.pin));
+    // CRITICAL FIX: Grouping the pins correctly based on their Port!
+    // U is alone on Port C. V and W are together on Port A.
+    gpio_init_callback(&hall_port_c_cb, hall_isr, BIT(hall_u.pin));
+    gpio_init_callback(&hall_port_a_cb, hall_isr, BIT(hall_v.pin) | BIT(hall_w.pin));
 
     gpio_add_callback(hall_u.port, &hall_port_c_cb); 
-    gpio_add_callback(hall_w.port, &hall_port_a_cb); 
+    gpio_add_callback(hall_v.port, &hall_port_a_cb); // Covers both V and W
 }
 
 void update_rpm_task(void) {
     if (new_rpm_data) {
+        unsigned int key = irq_lock();
+        uint32_t local_deltas[HISTORY_SIZE];
+        for (int i = 0; i < HISTORY_SIZE; i++) {
+            local_deltas[i] = delta_history[i];
+        }
         new_rpm_data = false;
-        
-        // 1. Safely sum the last 6 deltas
+        irq_unlock(key);
+
         uint32_t sum_delta = 0;
         for (int i = 0; i < HISTORY_SIZE; i++) {
-            sum_delta += delta_history[i];
+            sum_delta += local_deltas[i];
         }
-        
-        // 2. Calculate the smoothed RPM
-        // (Make sure sum_delta is large enough to avoid divide-by-zero)
+
         if (sum_delta > 0) {
-            current_rpm = RPM_CONSTANT_FILTERED / sum_delta;
+            uint32_t instant_rpm = 15000000 / sum_delta;
+            delta_history[delta_idx] = instant_rpm;
+            delta_idx = (delta_idx + 1) % HISTORY_SIZE;
+
+            uint64_t rpm_sum = 0; 
+            for (int i = 0; i < HISTORY_SIZE; i++) {
+                rpm_sum += delta_history[i];
+            }
+            current_rpm = (uint32_t)(rpm_sum / HISTORY_SIZE);
         }
     }
-    
-    // Timeout check
+
     if ((TIM2->CNT - previous_ticks) > TIMEOUT_TICKS) {
         current_rpm = 0;
-        // Optional: clear the buffer so old data doesn't skew the next startup
-        for(int i=0; i < HISTORY_SIZE; i++) delta_history[i] = 0;
+        for (int i = 0; i < HISTORY_SIZE; i++) delta_history[i] = 0;
     }
 }
 
@@ -272,7 +249,6 @@ void control_thread_fn(void) {
 
     while (1) {
         update_rpm_task();
-        // 1. Process Soft-Start Ramp
         if (is_running && (active_duty < DUTY_TARGET)) {
             active_duty += DUTY_STEP;
             if (active_duty > DUTY_TARGET) {
@@ -281,11 +257,9 @@ void control_thread_fn(void) {
             commutate(get_hall_state());
         }
 
-        // 2. Telemetry Printout (Every 500ms = 25 ticks of 20ms)
         if (++print_counter >= 25) {
-            // Calculate actual percentage to print to the terminal
             uint32_t current_percent = (active_duty * 100) / PWM_PERIOD_ARR;
-            if (!is_running) current_percent = 95; // Display bootstrap duty when stopped
+            if (!is_running) current_percent = 95; 
             
             printk("[TELEMETRY] Motor: %s | Duty: %d%% | Hall State: %d | RPM: %d\n", 
                    is_running ? "RUNNING" : "STOPPED", 
@@ -302,55 +276,54 @@ K_THREAD_DEFINE(control_thread_id, 1024, control_thread_fn, NULL, NULL, NULL, 7,
 
 // --- Main Loop ---
 int main(void) {
-    console_init();
+    const struct device *console_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+    unsigned char s;
+
+    /* Start the Native USB interface for Telemetry */
+    if (usb_enable(NULL)) {
+        return 0;
+    }
+    k_sleep(K_MSEC(1000)); // Brief pause to allow host PC to enumerate COM port
 
     setup_tim2_freerun();
-    
     setup_hall_interrupts();
     setup_motor_pwm();
 
     commutate(get_hall_state());
 
-    printk("System Ready (PWM Frequency: 21 kHz)\n");
+    printk("\n--- BLDC Control System Ready ---\n");
+    printk("PWM Frequency: 21 kHz\n");
     printk("Bootstrap Active: Low-sides holding at 85%%.\n");
     printk("Press 's' to START.\n");
-    printk("Press [ENTER] (or any other key) to STOP.\n");
+    printk("Press [SPACE] (or any other key) to STOP.\n");
+    printk("---------------------------------\n");
 
     while (1) {
-        char s = console_getchar(); // Blocks until a SINGLE character is pressed
-        
-        // 1. Handle the "Double Input" from terminal emulators
-        // Terminals often send Carriage Return ('\r') followed by Line Feed ('\n').
-        // We simply ignore the Line Feed so it doesn't trigger our logic twice.
-        if (s == '\n') {
-            continue; 
-        }
-
-        // 2. Start Command
-        if (s == 's' || s == 'S') {
-            if (!is_running) {
-                is_running = true;
-
-                printk("\n>>> COMMAND: Motor STARTING. Ramping from 5%% to 50%%...\n");
-
-                // active_duty = (PWM_PERIOD_ARR * 40) / 100; 
-                // commutate(get_hall_state());
-                // k_msleep(10);
-
-                active_duty = DUTY_START;
-                commutate(get_hall_state());
-            } else {
-                printk("\n>>> Note: Motor is already running.\n");
+        /* Safely poll for USB Serial commands */
+        if (uart_poll_in(console_dev, &s) == 0) {
+            if (s == '\n' || s == '\r') {
+                continue; 
             }
-        } 
-        // 3. Stop Command (Enter '\r', spacebar, or any other panic key)
-        else {
-            if (is_running) {
-                is_running = false;
-                printk("\n>>> COMMAND: Motor STOPPED. Bootstrap Active.\n");
-                commutate(get_hall_state());
+
+            if (s == 's' || s == 'S') {
+                if (!is_running) {
+                    is_running = true;
+                    printk("\n>>> COMMAND: Motor STARTING. Ramping from 5%% to 50%%...\n");
+                    active_duty = DUTY_START;
+                    commutate(get_hall_state());
+                } else {
+                    printk("\n>>> Note: Motor is already running.\n");
+                }
+            } 
+            else {
+                if (is_running) {
+                    is_running = false;
+                    printk("\n>>> COMMAND: Motor STOPPED. Bootstrap Active.\n");
+                    commutate(get_hall_state());
+                }
             }
         }
+        k_msleep(10); // Prevent tight spinning
     }
     return 0;
 }
