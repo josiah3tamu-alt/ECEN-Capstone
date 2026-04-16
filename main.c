@@ -62,37 +62,39 @@ void commutate(uint8_t step)
         return;
     }
 
-    if (counter_clockwise){
+    if (counter_clockwise) {
+        // CORRECTED REVERSE: -60-degree software shift 
+        // Compensates for physical Hall sensor offset to run CW smoothly
         switch (step) {
         case 5: 
-            TIM1->CCR2 = active_duty;
-            TIM1->CCR1 = DUTY_LOW_95;
-            TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC1NE;
-            break;
-        case 4: 
             TIM1->CCR3 = active_duty;
             TIM1->CCR1 = DUTY_LOW_95;
             TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC1NE;
             break;
-        case 6: 
+        case 4: 
             TIM1->CCR3 = active_duty;
             TIM1->CCR2 = DUTY_LOW_95;
             TIM1->CCER |= TIM_CCER_CC3E | TIM_CCER_CC2NE;
             break;
-        case 2: 
+        case 6: 
             TIM1->CCR1 = active_duty;
             TIM1->CCR2 = DUTY_LOW_95;
             TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2NE;
             break;
-        case 3: 
+        case 2: 
             TIM1->CCR1 = active_duty;
             TIM1->CCR3 = DUTY_LOW_95;
             TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC3NE;
             break;
-        case 1: 
+        case 3: 
             TIM1->CCR2 = active_duty;
             TIM1->CCR3 = DUTY_LOW_95;
             TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC3NE;
+            break;
+        case 1: 
+            TIM1->CCR2 = active_duty;
+            TIM1->CCR1 = DUTY_LOW_95;
+            TIM1->CCER |= TIM_CCER_CC2E | TIM_CCER_CC1NE;
             break;
         default: break;
         }
@@ -234,6 +236,9 @@ void update_rpm_task(void) {
                 rpm_sum += delta_history[i];
             }
             current_rpm = (uint32_t)(rpm_sum / HISTORY_SIZE);
+            if (current_rpm > 5000 || !is_running){
+                current_rpm = 0;
+            }
         }
     }
 
